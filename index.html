@@ -657,6 +657,11 @@ function getEmployees() {
 function saveEmployees(list) { save(EMPLOYEES_KEY, list); }
 
 // ─── APPS SCRIPT API ─────────────────────────────────────────────────────────
+// All reads/writes go through Apps Script — no CORS, no OAuth.
+// Local cache makes UI instant; Sheets syncs in background.
+
+let _activeCache = null;   // { employee: isoTime, ... }
+let _sessionsCache = null; // array of session objects
 
 async function scriptGet(sheet) {
   const url = APPS_SCRIPT_URL + '?sheet=' + encodeURIComponent(sheet);
@@ -681,13 +686,15 @@ async function scriptPost(payload) {
 // ─── SESSION READ/WRITE ──────────────────────────────────────────────────────
 
 async function getSessions() {
+  if (_sessionsCache) return _sessionsCache;
   try {
     const rows = await scriptGet(TAB_SESSIONS);
-    return rows.slice(1).map(r => ({
+    _sessionsCache = rows.slice(1).map(r => ({
       employee: r[0] || '', date: r[1] || '', dateISO: r[2] || '',
       clockIn: r[3] || '', clockOut: r[4] || '',
       hours: parseFloat(r[5]) || 0
     })).filter(s => s.employee);
+    return _sessionsCache;
   } catch(e) {
     console.error('getSessions error:', e);
     return load(SESSIONS_KEY) || [];
@@ -695,6 +702,8 @@ async function getSessions() {
 }
 
 async function appendSession(session) {
+  // Update local cache immediately
+  if (_sessionsCache) _sessionsCache.push(session);
   await scriptPost({
     action: 'append',
     sheet: TAB_SESSIONS,
@@ -706,11 +715,12 @@ async function appendSession(session) {
 // ─── ACTIVE CLOCK-INS READ/WRITE ─────────────────────────────────────────────
 
 async function getActive() {
+  if (_activeCache) return _activeCache;
   try {
     const rows = await scriptGet(TAB_ACTIVE);
-    const obj = {};
-    rows.slice(1).forEach(r => { if (r[0] && r[0].trim()) obj[r[0]] = r[1]; });
-    return obj;
+    _activeCache = {};
+    rows.slice(1).forEach(r => { if (r[0] && r[0].trim()) _activeCache[r[0]] = r[1]; });
+    return _activeCache;
   } catch(e) {
     console.error('getActive error:', e);
     return load(ACTIVE_KEY) || {};
@@ -718,36 +728,29 @@ async function getActive() {
 }
 
 async function setClockIn(employee, isoTime) {
+  // Update local cache immediately — UI responds at once
+  if (!_activeCache) _activeCache = {};
+  _activeCache[employee] = isoTime;
+  // Sync to Sheets in background
   const rows = await scriptGet(TAB_ACTIVE);
   const dataRows = rows.slice(1);
   const idx = dataRows.findIndex(r => r[0] === employee);
   if (idx >= 0) {
-    await scriptPost({
-      action: 'update',
-      sheet: TAB_ACTIVE,
-      range: `A${idx+2}:B${idx+2}`,
-      row: [employee, isoTime]
-    });
+    await scriptPost({ action: 'update', sheet: TAB_ACTIVE, range: `A${idx+2}:B${idx+2}`, row: [employee, isoTime] });
   } else {
-    await scriptPost({
-      action: 'append',
-      sheet: TAB_ACTIVE,
-      row: [employee, isoTime]
-    });
+    await scriptPost({ action: 'append', sheet: TAB_ACTIVE, row: [employee, isoTime] });
   }
 }
 
 async function removeClockIn(employee) {
+  // Update local cache immediately
+  if (_activeCache) delete _activeCache[employee];
+  // Sync to Sheets in background
   const rows = await scriptGet(TAB_ACTIVE);
   const dataRows = rows.slice(1);
   const idx = dataRows.findIndex(r => r[0] === employee);
   if (idx >= 0) {
-    await scriptPost({
-      action: 'update',
-      sheet: TAB_ACTIVE,
-      range: `A${idx+2}:B${idx+2}`,
-      row: ['', '']
-    });
+    await scriptPost({ action: 'update', sheet: TAB_ACTIVE, range: `A${idx+2}:B${idx+2}`, row: ['', ''] });
   }
 }
 
@@ -1030,6 +1033,11 @@ async function enterClockScreen(name) {
   document.getElementById('timeSource').textContent = '⏳ checking…';
   document.getElementById('timeSource').style.color = 'var(--muted)';
   showScreen('clock');
+
+  // Clear caches so we always get fresh data when entering clock screen
+  _activeCache   = null;
+  _sessionsCache = null;
+
   if (clockInterval) clearInterval(clockInterval);
   clockInterval = setInterval(() => { updateTimeDisplay(); updateElapsed(); }, 1000);
   updateTimeDisplay();
@@ -1099,7 +1107,9 @@ function updateElapsedSync(active) {
 }
 
 function updateElapsed() {
-  getActive().then(active => updateElapsedSync(active));
+  // Use local cache — never hit the API for the ticking elapsed timer
+  const active = _activeCache || {};
+  updateElapsedSync(active);
 }
 
 // ─── SERVER TIME ─────────────────────────────────────────────────────────────
@@ -1146,57 +1156,84 @@ async function handleClockAction() {
   btn.disabled = true;
   btn.textContent = 'Verifying time…';
 
-  const now = await getServerTime();
+  // Fetch server time and active state in parallel
+  const [now, active] = await Promise.all([getServerTime(), getActive()]);
+
   if (!now) {
     btn.disabled = false;
-    updateClockUISync({});
+    updateClockUISync(active);
     showToast('⚠️ No internet — cannot clock in/out', 'error');
     return;
   }
 
-  setSyncStatus('syncing');
-  btn.textContent = 'Saving…';
+  const isIn        = !!active[currentEmployee];
+  const clockInTime = active[currentEmployee]; // save before we delete it
 
-  try {
-    const active = await getActive();
-    if (!active[currentEmployee]) {
-      await setClockIn(currentEmployee, now.toISOString());
-      showToast(`✅ Clocked in at ${fmtTime(now)}`, 'success');
-    } else {
-      const inTime = new Date(active[currentEmployee]);
-      const hours  = Math.round(((now - inTime) / 3600000) * 100) / 100;
-      await appendSession({
-        employee: currentEmployee,
-        date:     now.toLocaleDateString('en-AU'),
-        dateISO:  now.toISOString().split('T')[0],
-        clockIn:  active[currentEmployee],
-        clockOut: now.toISOString(),
-        hours
-      });
-      await removeClockIn(currentEmployee);
-      showToast(`✅ Clocked out — ${hours.toFixed(2)} hrs logged`, 'success');
-    }
-    setSyncStatus('synced');
-  } catch(e) {
-    setSyncStatus('error');
-    console.error('Clock action error:', e);
-    // Show the actual error so we can diagnose it
-    showToast(`❌ Error: ${e.message}`, 'error');
+  // ── Update UI immediately using local cache ──
+  if (!isIn) {
+    // Clock IN — update cache, refresh UI right away
+    if (!_activeCache) _activeCache = {};
+    _activeCache[currentEmployee] = now.toISOString();
+    updateClockUISync(_activeCache);
+    showToast(`✅ Clocked in at ${fmtTime(now)}`, 'success');
     btn.disabled = false;
-    return;
-  }
+    renderSessions();
 
-  btn.disabled = false;
-  const activeNow = await getActive();
-  updateClockUISync(activeNow);
-  await renderSessions();
+    // Sync to Sheets in background
+    setSyncStatus('syncing');
+    try {
+      await setClockIn(currentEmployee, now.toISOString());
+      setSyncStatus('synced');
+    } catch(e) {
+      setSyncStatus('error');
+      console.error('Clock-in sync error:', e);
+      showToast(`⚠️ Sync error: ${e.message}`, 'error');
+    }
+
+  } else {
+    // Clock OUT — calculate hours, update cache, refresh UI right away
+    const inTime = new Date(clockInTime);
+    const hours  = Math.round(((now - inTime) / 3600000) * 100) / 100;
+    const session = {
+      employee: currentEmployee,
+      date:     now.toLocaleDateString('en-AU'),
+      dateISO:  now.toISOString().split('T')[0],
+      clockIn:  clockInTime,
+      clockOut: now.toISOString(),
+      hours
+    };
+
+    // Update caches immediately
+    if (!_activeCache) _activeCache = {};
+    delete _activeCache[currentEmployee];
+    if (_sessionsCache) _sessionsCache.push(session);
+
+    updateClockUISync(_activeCache);
+    showToast(`✅ Clocked out — ${hours.toFixed(2)} hrs logged`, 'success');
+    btn.disabled = false;
+    renderSessions();
+
+    // Sync to Sheets in background
+    setSyncStatus('syncing');
+    try {
+      await appendSession(session);
+      await removeClockIn(currentEmployee);
+      setSyncStatus('synced');
+    } catch(e) {
+      setSyncStatus('error');
+      console.error('Clock-out sync error:', e);
+      showToast(`⚠️ Sync error: ${e.message}`, 'error');
+    }
+  }
 }
 
 async function renderSessions() {
   const panel = document.getElementById('sessionsPanel');
-  panel.innerHTML = '<div class="empty-msg" style="padding:1rem;">Loading…</div>';
 
-  const [sessions, active] = await Promise.all([getSessions(), getActive()]);
+  // Use local caches if available for instant render, otherwise fetch
+  const sessions = _sessionsCache || await getSessions();
+  const active   = _activeCache   || await getActive();
+
   const mySessions = sessions
     .filter(s => s.employee === currentEmployee)
     .sort((a,b) => new Date(b.clockIn) - new Date(a.clockIn));
