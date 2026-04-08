@@ -630,24 +630,16 @@ const USERS_KEY      = 'tc_users_v3';
 const ADMIN_PW_KEY   = 'tc_admin_pw';
 const EMPLOYEES_KEY  = 'tc_employees_v3';
 
-// ─── GOOGLE SHEETS CONFIG ────────────────────────────────────────────────────
+// ─── GOOGLE APPS SCRIPT CONFIG ──────────────────────────────────────────────
+// All Sheets operations go through Apps Script — no CORS, no OAuth needed.
 
-const GS_SHEET_ID  = '1oujezK_cdsxuaxORhlhN8MJ_FmEVH_xyJQsJ4jgFK_0';
-const GS_API_KEY   = 'AIzaSyDJ73tmbmJXkHNJ3B7NV16ijjM2IFc1bSM';
-const GS_CLIENT_ID = '439434196024-pegqs4qbenelm34lm28jbfn8b1nfoitg.apps.googleusercontent.com';
-const GS_SCOPES    = 'https://www.googleapis.com/auth/spreadsheets';
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyM98EMaaAJShbRmDPZCnzJBdEpXYJRmSJ1jBolrQI3-1Jy1DmTMs1I0CoEAr2rps3s/exec';
 
-// Sheet tab names
 const TAB_SESSIONS = 'Sessions';
 const TAB_ACTIVE   = 'Active';
 
-let gsReady    = false;  // true once GIS token client is ready
-let gsSignedIn = false;
-
-// GIS token state (replaces deprecated gapi.auth2)
-let accessToken = null;
-let tokenExpiry = 0;
-let tokenClient = null;
+let gsReady    = true;
+let gsSignedIn = true;
 
 // ─── LOCAL STORAGE (PIN / employees only) ────────────────────────────────────
 
@@ -664,190 +656,105 @@ function getEmployees() {
 }
 function saveEmployees(list) { save(EMPLOYEES_KEY, list); }
 
-// ─── GOOGLE SHEETS API ───────────────────────────────────────────────────────
+// ─── APPS SCRIPT API ─────────────────────────────────────────────────────────
 
-function sheetsURL(range) {
-  return `https://sheets.googleapis.com/v4/spreadsheets/${GS_SHEET_ID}/values/${encodeURIComponent(range)}`;
-}
-
-async function refreshTokenIfNeeded() {
-  if (accessToken && Date.now() < tokenExpiry) return;
-  if (!tokenClient) throw new Error('Not authenticated');
-  await new Promise((resolve, reject) => {
-    tokenClient.callback = response => {
-      if (response.error) { reject(new Error(response.error)); return; }
-      accessToken = response.access_token;
-      tokenExpiry = Date.now() + ((response.expires_in || 3599) * 1000) - 60000;
-      resolve();
-    };
-    tokenClient.requestAccessToken({ prompt: '' });
-  });
-}
-
-async function sheetsGet(range) {
-  await refreshTokenIfNeeded();
-  const r = await fetch(sheetsURL(range) + '?key=' + GS_API_KEY, {
-    headers: { Authorization: 'Bearer ' + accessToken }
-  });
-  if (!r.ok) {
-    const err = await r.json().catch(() => ({}));
-    throw new Error(`sheetsGet ${r.status}: ${err?.error?.message || r.statusText}`);
-  }
+async function scriptGet(sheet) {
+  const url = APPS_SCRIPT_URL + '?sheet=' + encodeURIComponent(sheet);
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('GET failed: ' + r.status);
   const d = await r.json();
-  return d.values || [];
+  if (!d.success) throw new Error(d.error || 'GET error');
+  return d.data || [];
 }
 
-async function sheetsAppend(range, values) {
-  await refreshTokenIfNeeded();
-  const r = await fetch(sheetsURL(range) + '?valueInputOption=RAW&key=' + GS_API_KEY, {
+async function scriptPost(payload) {
+  const r = await fetch(APPS_SCRIPT_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + accessToken },
-    body: JSON.stringify({ values })
+    body: JSON.stringify(payload)
   });
-  if (!r.ok) {
-    const err = await r.json().catch(() => ({}));
-    throw new Error(`sheetsAppend ${r.status}: ${err?.error?.message || r.statusText}`);
-  }
-}
-
-async function sheetsClear(range) {
-  await refreshTokenIfNeeded();
-  const r = await fetch(sheetsURL(range) + ':clear?key=' + GS_API_KEY, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + accessToken }
-  });
-  if (!r.ok) {
-    const err = await r.json().catch(() => ({}));
-    throw new Error(`sheetsClear ${r.status}: ${err?.error?.message || r.statusText}`);
-  }
-}
-
-async function sheetsUpdate(range, values) {
-  await refreshTokenIfNeeded();
-  const r = await fetch(sheetsURL(range) + '?valueInputOption=RAW&key=' + GS_API_KEY, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + accessToken },
-    body: JSON.stringify({ values })
-  });
-  if (!r.ok) {
-    const err = await r.json().catch(() => ({}));
-    throw new Error(`sheetsUpdate ${r.status}: ${err?.error?.message || r.statusText}`);
-  }
-}
-
-// Ensure both sheet tabs exist
-async function ensureSheets() {
-  await refreshTokenIfNeeded();
-  const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GS_SHEET_ID}?key=${GS_API_KEY}`, {
-    headers: { Authorization: 'Bearer ' + accessToken }
-  });
-  const meta = await r.json();
-  const existing = meta.sheets.map(s => s.properties.title);
-  const toCreate = [TAB_SESSIONS, TAB_ACTIVE].filter(t => !existing.includes(t));
-  if (!toCreate.length) return;
-
-  await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${GS_SHEET_ID}:batchUpdate?key=${GS_API_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-    body: JSON.stringify({
-      requests: toCreate.map(title => ({ addSheet: { properties: { title } } }))
-    })
-  });
-
-  // Add headers
-  if (toCreate.includes(TAB_SESSIONS)) {
-    await sheetsUpdate(`${TAB_SESSIONS}!A1:F1`, [['Employee','Date','DateISO','ClockIn','ClockOut','Hours']]);
-  }
-  if (toCreate.includes(TAB_ACTIVE)) {
-    await sheetsUpdate(`${TAB_ACTIVE}!A1:B1`, [['Employee','ClockInTime']]);
-  }
+  if (!r.ok) throw new Error('POST failed: ' + r.status);
+  const d = await r.json();
+  if (!d.success) throw new Error(d.error || 'POST error');
+  return d;
 }
 
 // ─── SESSION READ/WRITE ──────────────────────────────────────────────────────
 
 async function getSessions() {
   try {
-    const rows = await sheetsGet(`${TAB_SESSIONS}!A2:F`);
-    return rows.map(r => ({
+    const rows = await scriptGet(TAB_SESSIONS);
+    return rows.slice(1).map(r => ({
       employee: r[0] || '', date: r[1] || '', dateISO: r[2] || '',
       clockIn: r[3] || '', clockOut: r[4] || '',
       hours: parseFloat(r[5]) || 0
     })).filter(s => s.employee);
-  } catch { return load(SESSIONS_KEY) || []; }
+  } catch(e) {
+    console.error('getSessions error:', e);
+    return load(SESSIONS_KEY) || [];
+  }
 }
 
 async function appendSession(session) {
-  await sheetsAppend(`${TAB_SESSIONS}!A:F`, [[
-    session.employee, session.date, session.dateISO,
-    session.clockIn, session.clockOut, session.hours
-  ]]);
+  await scriptPost({
+    action: 'append',
+    sheet: TAB_SESSIONS,
+    row: [session.employee, session.date, session.dateISO,
+          session.clockIn, session.clockOut, session.hours]
+  });
 }
 
 // ─── ACTIVE CLOCK-INS READ/WRITE ─────────────────────────────────────────────
 
 async function getActive() {
   try {
-    const rows = await sheetsGet(`${TAB_ACTIVE}!A2:B`);
+    const rows = await scriptGet(TAB_ACTIVE);
     const obj = {};
-    rows.forEach(r => { if (r[0] && r[0].trim()) obj[r[0]] = r[1]; });
+    rows.slice(1).forEach(r => { if (r[0] && r[0].trim()) obj[r[0]] = r[1]; });
     return obj;
-  } catch { return load(ACTIVE_KEY) || {}; }
+  } catch(e) {
+    console.error('getActive error:', e);
+    return load(ACTIVE_KEY) || {};
+  }
 }
 
 async function setClockIn(employee, isoTime) {
-  const rows = await sheetsGet(`${TAB_ACTIVE}!A2:B`);
-  const idx = rows.findIndex(r => r[0] === employee);
+  const rows = await scriptGet(TAB_ACTIVE);
+  const dataRows = rows.slice(1);
+  const idx = dataRows.findIndex(r => r[0] === employee);
   if (idx >= 0) {
-    await sheetsUpdate(`${TAB_ACTIVE}!A${idx+2}:B${idx+2}`, [[employee, isoTime]]);
+    await scriptPost({
+      action: 'update',
+      sheet: TAB_ACTIVE,
+      range: `A${idx+2}:B${idx+2}`,
+      row: [employee, isoTime]
+    });
   } else {
-    await sheetsAppend(`${TAB_ACTIVE}!A:B`, [[employee, isoTime]]);
+    await scriptPost({
+      action: 'append',
+      sheet: TAB_ACTIVE,
+      row: [employee, isoTime]
+    });
   }
 }
 
 async function removeClockIn(employee) {
-  const rows = await sheetsGet(`${TAB_ACTIVE}!A2:B`);
-  const idx = rows.findIndex(r => r[0] === employee);
+  const rows = await scriptGet(TAB_ACTIVE);
+  const dataRows = rows.slice(1);
+  const idx = dataRows.findIndex(r => r[0] === employee);
   if (idx >= 0) {
-    await sheetsUpdate(`${TAB_ACTIVE}!A${idx+2}:B${idx+2}`, [['', '']]);
+    await scriptPost({
+      action: 'update',
+      sheet: TAB_ACTIVE,
+      range: `A${idx+2}:B${idx+2}`,
+      row: ['', '']
+    });
   }
 }
 
 // ─── GOOGLE AUTH (Google Identity Services) ──────────────────────────────────
-// Replaces the deprecated gapi.auth2 library (shut down March 2023).
-// Uses google.accounts.oauth2.initTokenClient from accounts.google.com/gsi/client.
-
-function initGoogleAuth() {
-  // GIS is loaded in init(); here we just set up the token client.
-  return new Promise(resolve => {
-    try {
-      tokenClient = google.accounts.oauth2.initTokenClient({
-        client_id: GS_CLIENT_ID,
-        scope: GS_SCOPES,
-        callback: () => {} // overridden per-call
-      });
-      gsReady = true;
-      resolve(false); // Require explicit sign-in click each session
-    } catch(e) {
-      gsReady = false;
-      resolve(false);
-    }
-  });
-}
-
-async function signInToGoogle() {
-  return new Promise(resolve => {
-    if (!tokenClient) { resolve(false); return; }
-    tokenClient.callback = async response => {
-      if (response.error || !response.access_token) { resolve(false); return; }
-      accessToken  = response.access_token;
-      tokenExpiry  = Date.now() + ((response.expires_in || 3599) * 1000) - 60000;
-      gsSignedIn   = true;
-      try { await ensureSheets(); } catch(e) { /* non-fatal */ }
-      resolve(true);
-    };
-    tokenClient.requestAccessToken({ prompt: 'select_account' });
-  });
-}
+// Auth no longer needed — Apps Script handles all Sheets access
+function initGoogleAuth() { return Promise.resolve(true); }
+async function signInToGoogle() { return true; }
 
 // ─── SYNC STATUS ─────────────────────────────────────────────────────────────
 
@@ -1201,23 +1108,27 @@ function updateElapsed() {
 
 async function getServerTime() {
   const apis = [
+    // Cloudflare trace - most reliable, always CORS friendly
     async () => {
-      const r = await fetch('https://worldtimeapi.org/api/timezone/Australia/Brisbane', { cache: 'no-store' });
-      const d = await r.json();
-      return new Date(d.datetime);
-    },
-    async () => {
-      const r = await fetch('https://timeapi.io/api/time/current/zone?timeZone=Australia%2FBrisbane', { cache: 'no-store' });
-      const d = await r.json();
-      return new Date(`${d.date}T${d.time}`);
-    },
-    async () => {
-      // Cloudflare's always-on date header trick
       const r = await fetch('https://www.cloudflare.com/cdn-cgi/trace', { cache: 'no-store' });
       const text = await r.text();
       const ts = text.match(/ts=([0-9.]+)/)?.[1];
       if (!ts) throw new Error('no ts');
       return new Date(parseFloat(ts) * 1000);
+    },
+    // TimeAPI.io
+    async () => {
+      const r = await fetch('https://timeapi.io/api/time/current/zone?timeZone=Australia%2FBrisbane', { cache: 'no-store' });
+      if (!r.ok) throw new Error('timeapi failed');
+      const d = await r.json();
+      return new Date(`${d.date}T${d.time}`);
+    },
+    // Google's own servers - always reachable if Sheets works
+    async () => {
+      const r = await fetch('https://sheets.googleapis.com/$discovery/rest?version=v4', { cache: 'no-store' });
+      const date = r.headers.get('date');
+      if (!date) throw new Error('no date header');
+      return new Date(date);
     }
   ];
 
@@ -1227,7 +1138,7 @@ async function getServerTime() {
       if (t && !isNaN(t)) return t;
     } catch {}
   }
-  return null; // All failed
+  return null;
 }
 
 async function handleClockAction() {
@@ -1587,37 +1498,16 @@ async function init() {
   buildAlphaBar();
   renderEmployeeGrid();
 
-  // Load Google Identity Services library (replaces deprecated apis.google.com/js/api.js + auth2)
-  await new Promise(resolve => {
-    const s = document.createElement('script');
-    s.src = 'https://accounts.google.com/gsi/client';
-    s.onload = resolve;
-    s.onerror = resolve; // continue even if offline
-    document.head.appendChild(s);
-  });
-
-  await initGoogleAuth();
-
   const text = document.getElementById('syncIndicatorText');
   const testBtn = document.getElementById('testWriteBtn');
-  if (gsReady && text) {
-    text.innerHTML = '<button onclick="doGoogleSignIn()" style="background:var(--accent2);border:none;color:#fff;padding:0.4rem 1rem;border-radius:8px;font-family:Syne,sans-serif;font-size:0.82rem;font-weight:700;cursor:pointer;">🔑 Sign in with Google to sync</button>';
-  } else if (text) {
-    text.textContent = '⚠️ Google Sheets unavailable — offline mode';
-    text.style.color = 'var(--warn)';
-  }
-}
-
-async function doGoogleSignIn() {
-  const ok = await signInToGoogle();
-  const text = document.getElementById('syncIndicatorText');
-  const testBtn = document.getElementById('testWriteBtn');
-  if (ok) {
+  if (text) { text.textContent = '⏳ Connecting to Google Sheets…'; }
+  try {
+    await scriptGet(TAB_ACTIVE);
     if (text) { text.textContent = '☁ Connected to Google Sheets'; text.style.color = 'var(--accent)'; }
     if (testBtn) testBtn.style.display = 'inline-block';
-    showToast('✅ Connected to Google Sheets', 'success');
-  } else {
-    showToast('Sign-in cancelled or failed', 'error');
+  } catch(e) {
+    if (text) { text.textContent = '⚠️ Could not reach Google Sheets'; text.style.color = 'var(--warn)'; }
+    console.error('Init connection error:', e);
   }
 }
 
@@ -1625,11 +1515,10 @@ async function testSheetWrite() {
   const btn = document.getElementById('testWriteBtn');
   btn.textContent = 'Testing…';
   try {
-    await sheetsAppend(`${TAB_SESSIONS}!A:F`, [['__TEST__', 'test', 'test', 'test', 'test', '0']]);
-    // Clean it up
-    const rows = await sheetsGet(`${TAB_SESSIONS}!A2:F`);
-    const idx = rows.findIndex(r => r[0] === '__TEST__');
-    if (idx >= 0) await sheetsUpdate(`${TAB_SESSIONS}!A${idx+2}:F${idx+2}`, [['','','','','','']]);
+    await scriptPost({ action: 'append', sheet: TAB_SESSIONS, row: ['__TEST__', 'test', 'test', 'test', 'test', '0'] });
+    const rows = await scriptGet(TAB_SESSIONS);
+    const idx = rows.slice(1).findIndex(r => r[0] === '__TEST__');
+    if (idx >= 0) await scriptPost({ action: 'update', sheet: TAB_SESSIONS, range: `A${idx+2}:F${idx+2}`, row: ['','','','','',''] });
     btn.textContent = '✅ Write OK';
     btn.style.color = 'var(--accent)';
     showToast('✅ Google Sheets write successful!', 'success');
@@ -1641,6 +1530,7 @@ async function testSheetWrite() {
   }
   setTimeout(() => { btn.textContent = 'Test write'; btn.style.color = ''; }, 4000);
 }
+
 
 init();
 </script>
